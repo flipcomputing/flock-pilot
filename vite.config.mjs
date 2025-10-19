@@ -202,7 +202,7 @@ export default {
         "../.."
       ]
     },
-    allowedHosts: ['1099a351-df60-40b5-bf61-4999bad0d153-00-4np7mg24c4rr.janeway.replit.dev'] //added this
+    allowedHosts: ['866e1576-ad4b-445e-a09d-279e4a99fdbd-00-3mmxwc3xdeaxv.riker.replit.dev'] 
   },
   optimizeDeps: { exclude: ["@babylonjs/havok"] },
   build: {

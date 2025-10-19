@@ -14,6 +14,48 @@ export function generateUniqueId(prefix = "") {
 	return `${prefix}_${uniqueIdCounter}`;
 }
 
+function sanitizeForCode(input) {
+	let s = String(input);
+
+	// Cut from the first *real* newline (\r, \n, or Unicode line separator)
+	s = s.replace(/[\r\n\u2028\u2029].*$/s, "");
+	// Cut from the first *escaped* newline sequence (\n, \r, \u2028, \u2029, \x0A, \x0D)
+	s = s.replace(/\\(?:n|r|u(?:2028|2029|000a|000d)|x0(?:a|d)).*$/i, "");
+
+	// Remove any trailing backslashes that could remain (edge cases)
+	s = s.replace(/\\+$/, "");
+
+	// Neutralize comment and template literal markers
+	s = s.replace(/\*\//g, "*∕").replace(/\/\//g, "∕∕").replace(/`/g, "ˋ");
+
+	// Strip control characters (optional, keeps tabs/spaces)
+	s = s.replace(/[\u0000-\u001F\u007F]/g, "");
+
+	return s;
+}
+
+function emitSafeTextArg(code) {
+	if (!code) return '""';
+	const m = code.match(/^(['"`])(.*)\1$/s);
+	if (!m) return code;
+
+	const q = m[1];
+	const body = m[2];
+
+	// Decode literal safely (handles \', \\ , \n, \uXXXX, etc.)
+	let decoded;
+	try {
+		decoded = JSON.parse(q + body + q);
+	} catch {
+		decoded = body
+			.replace(/\\"/g, '"')
+			.replace(/\\'/g, "'")
+			.replace(/\\\\/g, "\\");
+	}
+
+	return JSON.stringify(sanitizeForCode(decoded));
+}
+
 export function defineGenerators() {
 	javascriptGenerator.forBlock["show"] = function (block) {
 		const modelName = javascriptGenerator.nameDB_.getName(
@@ -142,110 +184,112 @@ export function defineGenerators() {
 	};
 
 	javascriptGenerator.forBlock["animation"] = function (block) {
-	  const meshVariable = javascriptGenerator.nameDB_.getName(
-		block.getFieldValue("MESH"),
-		Blockly.Names.NameType.VARIABLE
-	  );
-	  const property = block.getFieldValue("PROPERTY");
-	  const animationGroupVar = javascriptGenerator.nameDB_.getName(
-		block.getFieldValue("ANIMATION_GROUP"),
-		Blockly.Names.NameType.VARIABLE
-	  );
-	  const keyframesBlock = block.getInputTargetBlock("KEYFRAMES");
-	  const keyframesArray = [];
+		const meshVariable = javascriptGenerator.nameDB_.getName(
+			block.getFieldValue("MESH"),
+			Blockly.Names.NameType.VARIABLE,
+		);
+		const property = block.getFieldValue("PROPERTY");
+		const animationGroupVar = javascriptGenerator.nameDB_.getName(
+			block.getFieldValue("ANIMATION_GROUP"),
+			Blockly.Names.NameType.VARIABLE,
+		);
+		const keyframesBlock = block.getInputTargetBlock("KEYFRAMES");
+		const keyframesArray = [];
 
-	  if (keyframesBlock) {
-		// Loop through keyframe blocks to gather data
-		for (let i = 0; i < keyframesBlock.inputList.length; i++) {
-		  const keyframeInput = keyframesBlock.inputList[i];
-		  const valueBlock = keyframeInput.connection
-			? keyframeInput.connection.targetBlock()
-			: null;
-		  let value;
+		if (keyframesBlock) {
+			// Loop through keyframe blocks to gather data
+			for (let i = 0; i < keyframesBlock.inputList.length; i++) {
+				const keyframeInput = keyframesBlock.inputList[i];
+				const valueBlock = keyframeInput.connection
+					? keyframeInput.connection.targetBlock()
+					: null;
+				let value;
 
-		  if (valueBlock) {
-			// If the keyframe block is of type "colour_keyframe", treat it as a color keyframe.
-			if (valueBlock.type === "colour_keyframe") {
-			  value = javascriptGenerator.valueToCode(
-				valueBlock,
-				"VALUE",
-				javascriptGenerator.ORDER_NONE
-			  );
-			} else if (property === "color") {
-			  // Otherwise, if property equals "color", extract as a color.
-			  value = javascriptGenerator.valueToCode(
-				valueBlock,
-				"VALUE",
-				javascriptGenerator.ORDER_NONE
-			  );
-			} else if (["position", "rotation", "scaling"].includes(property)) {
-			  // For vector keyframes, extract X, Y, and Z.
-			  const x =
-				javascriptGenerator.valueToCode(
-				  valueBlock,
-				  "X",
-				  javascriptGenerator.ORDER_ATOMIC
-				) || 0;
-			  const y =
-				javascriptGenerator.valueToCode(
-				  valueBlock,
-				  "Y",
-				  javascriptGenerator.ORDER_ATOMIC
-				) || 0;
-			  const z =
-				javascriptGenerator.valueToCode(
-				  valueBlock,
-				  "Z",
-				  javascriptGenerator.ORDER_ATOMIC
-				) || 0;
-			  value = `new flock.BABYLON.Vector3(${x}, ${y}, ${z})`;
-			} else {
-			  // Handle alpha or other scalar properties.
-			  value = javascriptGenerator.valueToCode(
-				valueBlock,
-				"VALUE",
-				javascriptGenerator.ORDER_ATOMIC
-			  );
+				if (valueBlock) {
+					// If the keyframe block is of type "colour_keyframe", treat it as a color keyframe.
+					if (valueBlock.type === "colour_keyframe") {
+						value = javascriptGenerator.valueToCode(
+							valueBlock,
+							"VALUE",
+							javascriptGenerator.ORDER_NONE,
+						);
+					} else if (property === "color") {
+						// Otherwise, if property equals "color", extract as a color.
+						value = javascriptGenerator.valueToCode(
+							valueBlock,
+							"VALUE",
+							javascriptGenerator.ORDER_NONE,
+						);
+					} else if (
+						["position", "rotation", "scaling"].includes(property)
+					) {
+						// For vector keyframes, extract X, Y, and Z.
+						const x =
+							javascriptGenerator.valueToCode(
+								valueBlock,
+								"X",
+								javascriptGenerator.ORDER_ATOMIC,
+							) || 0;
+						const y =
+							javascriptGenerator.valueToCode(
+								valueBlock,
+								"Y",
+								javascriptGenerator.ORDER_ATOMIC,
+							) || 0;
+						const z =
+							javascriptGenerator.valueToCode(
+								valueBlock,
+								"Z",
+								javascriptGenerator.ORDER_ATOMIC,
+							) || 0;
+						 value = `createVector3(${x}, ${y}, ${z})`;
+					} else {
+						// Handle alpha or other scalar properties.
+						value = javascriptGenerator.valueToCode(
+							valueBlock,
+							"VALUE",
+							javascriptGenerator.ORDER_ATOMIC,
+						);
+					}
+				} else {
+					// Default value for missing blocks.
+					value =
+						property === "color" || property === "colour_keyframe"
+							? '"#ffffff"'
+							: `createVector3(0, 0, 0)`;
+				}
+
+				// Retrieve the duration (using the same connection as value).
+				const durationBlock = keyframeInput.connection
+					? keyframeInput.connection.targetBlock()
+					: null;
+				const duration = durationBlock
+					? javascriptGenerator.valueToCode(
+							durationBlock,
+							"DURATION",
+							javascriptGenerator.ORDER_ATOMIC,
+						)
+					: "1"; // Default duration of 1 second if not specified
+
+				keyframesArray.push({ value, duration });
 			}
-		  } else {
-			// Default value for missing blocks.
-			value =
-			  (property === "color" || property === "colour_keyframe")
-				? '"#ffffff"'
-				: `new flock.BABYLON.Vector3(0, 0, 0)`;
-		  }
-
-		  // Retrieve the duration (using the same connection as value).
-		  const durationBlock = keyframeInput.connection
-			? keyframeInput.connection.targetBlock()
-			: null;
-		  const duration = durationBlock
-			? javascriptGenerator.valueToCode(
-				durationBlock,
-				"DURATION",
-				javascriptGenerator.ORDER_ATOMIC
-			  )
-			: "1"; // Default duration of 1 second if not specified
-
-		  keyframesArray.push({ value, duration });
 		}
-	  }
 
-	  const easing = block.getFieldValue("EASING") || "Linear";
-	  const loop = block.getFieldValue("LOOP") === "TRUE";
-	  const reverse = block.getFieldValue("REVERSE") === "TRUE";
-	  const mode = block.getFieldValue("MODE");
+		const easing = block.getFieldValue("EASING") || "Linear";
+		const loop = block.getFieldValue("LOOP") === "TRUE";
+		const reverse = block.getFieldValue("REVERSE") === "TRUE";
+		const mode = block.getFieldValue("MODE");
 
-	  const keyframesCode = keyframesArray
-		.map(
-		  (kf) => `{
+		const keyframesCode = keyframesArray
+			.map(
+				(kf) => `{
 			value: ${kf.value}, 
 			duration: ${kf.duration}
-		  }`
-		)
-		.join(", ");
+		  }`,
+			)
+			.join(", ");
 
-	  return `
+		return `
 		${animationGroupVar} = await createAnimation(
 		  ${animationGroupVar},
 		  ${meshVariable},
@@ -312,7 +356,7 @@ export function defineGenerators() {
 								"Z",
 								javascriptGenerator.ORDER_ATOMIC,
 							) || 0;
-						value = `new flock.BABYLON.Vector3(${x}, ${y}, ${z})`; // Generate the text for Vector3, not the object itself
+						 value = `createVector3(${x}, ${y}, ${z})`;
 					} else {
 						// Handle alpha or other properties
 						value = javascriptGenerator.valueToCode(
@@ -326,7 +370,7 @@ export function defineGenerators() {
 					value =
 						property === "color"
 							? '"#ffffff"'
-							: `new flock.BABYLON.Vector3(0, 0, 0)`; // Correct color string for colours
+							: `new createVector3(0, 0, 0)`; // Correct color string for colours
 				}
 
 				const duration = durationBlock
@@ -410,7 +454,7 @@ export function defineGenerators() {
 			"DURATION",
 			javascriptGenerator.ORDER_ATOMIC,
 		);
-		const code = `{ value: new flock.BABYLON.Vector3(${x}, ${y}, ${z}), duration: ${duration} }`;
+		const code = `{ value: createVector3(${x}, ${y}, ${z}), duration: ${duration} }`;
 		return [code, javascriptGenerator.ORDER_ATOMIC];
 	};
 
@@ -467,7 +511,7 @@ export function defineGenerators() {
 								"Z",
 								javascriptGenerator.ORDER_ATOMIC,
 							) || 0;
-						value = `new flock.BABYLON.Vector3(${x}, ${y}, ${z})`; // Generate the text for Vector3, not the object itself
+						 value = `createVector3(${x}, ${y}, ${z})`; // Generate the text for Vector3, not the object itself
 					} else {
 						// Handle alpha or other properties
 						value = javascriptGenerator.valueToCode(
@@ -481,7 +525,7 @@ export function defineGenerators() {
 					value =
 						property === "color"
 							? '"#ffffff"'
-							: `new flock.BABYLON.Vector3(0, 0, 0)`; // Correct color string for colours
+							: `createVector3(0, 0, 0)`; // Correct color string for colours
 				}
 
 				const duration = durationBlock
@@ -520,12 +564,11 @@ export function defineGenerators() {
 	};
 
 	javascriptGenerator.forBlock["min_centre_max"] = function (block) {
-	  const pivotOption = block.getFieldValue("PIVOT_OPTION");
+		const pivotOption = block.getFieldValue("PIVOT_OPTION");
 
-	  // Return the string value as a quoted literal
-	  return [`"${pivotOption}"`, javascriptGenerator.ORDER_ATOMIC];
+		// Return the string value as a quoted literal
+		return [`"${pivotOption}"`, javascriptGenerator.ORDER_ATOMIC];
 	};
-
 
 	javascriptGenerator.forBlock["set_pivot"] = function (block) {
 		const meshVar = javascriptGenerator.nameDB_.getName(
@@ -565,7 +608,7 @@ export function defineGenerators() {
 		const branch = javascriptGenerator.statementToCode(block, "DO");
 		return `start(async function() {\n${branch}});\n`;
 	};
-	
+
 	javascriptGenerator.forBlock["create_ground"] = function (block) {
 		const meshId = "ground";
 		meshMap[meshId] = block;
@@ -592,6 +635,7 @@ export function defineGenerators() {
 		return "";
 	};
 	javascriptGenerator.forBlock["set_sky_color"] = function (block) {
+		console.log("Generating sky block...");
 		const meshId = "sky";
 		meshMap[meshId] = block;
 		meshBlockIdMap[meshId] = block.id;
@@ -624,9 +668,13 @@ export function defineGenerators() {
 				"COMMENT",
 				javascriptGenerator.ORDER_ATOMIC,
 			) || "''";
-		return `// ${commentText}\n`;
+
+		const safeTextArg = emitSafeTextArg(commentText);
+
+		return `// ${safeTextArg}\n`;
 	};
 
+	
 	javascriptGenerator.forBlock["print_text"] = function (block) {
 		const text =
 			javascriptGenerator.valueToCode(
@@ -641,7 +689,10 @@ export function defineGenerators() {
 				javascriptGenerator.ORDER_ATOMIC,
 			) || "0";
 		const color = getFieldValue(block, "COLOR", "#9932CC");
-		return `printText(${text}, ${duration}, ${color});\n`;
+
+		const safeTextArg = emitSafeTextArg(text);
+
+		return `printText(${safeTextArg}, ${duration}, ${color});\n`;
 	};
 
 	javascriptGenerator.forBlock["set_fog"] = function (block) {
@@ -694,10 +745,12 @@ export function defineGenerators() {
 			Blockly.VARIABLE_CATEGORY_NAME,
 		);
 
+		const safeTextArg = emitSafeTextArg(text);
 		// Generate the code using the helper function
-		const code = `${textBlockVar} = UIText(${text}, ${x}, ${y}, ${fontSize}, ${color}, ${duration}, ${textBlockVar});\n`;
+		const code = `${textBlockVar} = UIText(${safeTextArg}, ${x}, ${y}, ${fontSize}, ${color}, ${duration}, ${textBlockVar});\n`;
 		return code;
 	};
+
 
 	javascriptGenerator.forBlock["ui_button"] = function (block) {
 		// Retrieve values from the block
@@ -737,8 +790,10 @@ export function defineGenerators() {
 
 		const buttonId = `Button_${generateUniqueId()}`;
 
+		const safeTextArg = emitSafeTextArg(text);
+
 		// Generate the UIButton call with text size support
-		const code = `${buttonVar} = UIButton(${text}, ${x}, ${y}, ${width}, ${textSize}, ${textColor}, ${backgroundColor}, "${buttonId}");\n`;
+		const code = `${buttonVar} = UIButton(${safeTextArg}, ${x}, ${y}, ${width}, ${textSize}, ${textColor}, ${backgroundColor}, "${buttonId}");\n`;
 		return code;
 	};
 
@@ -782,7 +837,9 @@ export function defineGenerators() {
 
 		const asyncWrapper = asyncMode === "AWAIT" ? "await " : "";
 
-		return `${asyncWrapper}say(${meshVariable}, ${text}, ${duration}, ${textColor}, ${backgroundColor}, ${alpha}, ${size}, "${mode}");\n`;
+		const safeTextArg = emitSafeTextArg(text);
+
+		return `${asyncWrapper}say(${meshVariable}, ${safeTextArg}, ${duration}, ${textColor}, ${backgroundColor}, ${alpha}, ${size}, "${mode}");\n`;
 	};
 
 	javascriptGenerator.forBlock["load_model"] = function (block) {
@@ -1024,8 +1081,10 @@ export function defineGenerators() {
 
 		doCode = doCode ? `async function() {\n${doCode}\n}` : "";
 
+		const safeTextArg = emitSafeTextArg(textCode);
+		
 		return `${variableName} = create3DText({
-			text: ${text},
+			text: ${safeTextArg},
 			font: '${font}',
 			color: ${color},
 			size: ${size},
@@ -2897,7 +2956,6 @@ javascriptGenerator.forBlock["controls_repeat_ext"] = function (
 	return code;
 };
 
-
 javascriptGenerator.forBlock["controls_for"] = function (block, generator) {
 	const variable0 = generator.getVariableName(block.getFieldValue("VAR"));
 
@@ -2971,10 +3029,10 @@ javascriptGenerator.forBlock["for_loop"] = function (block, generator) {
 		}
 	`;
 };
-javascriptGenerator.forBlock['get_lexical_variable'] = function(block) {
-  const variableName = block.getFieldValue('VAR');
-  const code = variableName;
-  return [code, javascriptGenerator.ORDER_ATOMIC];
+javascriptGenerator.forBlock["get_lexical_variable"] = function (block) {
+	const variableName = block.getFieldValue("VAR");
+	const code = variableName;
+	return [code, javascriptGenerator.ORDER_ATOMIC];
 };
 
 javascriptGenerator.forBlock["controls_forEach"] = function (block, generator) {

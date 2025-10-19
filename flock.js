@@ -2,6 +2,8 @@
 // Dr Tracy Gardner - https://github.com/tracygardner
 // Flip Computing Limited - flipcomputing.com
 
+import * as acorn from "acorn";
+import * as walk from "acorn-walk";
 import HavokPhysics from "@babylonjs/havok";
 import * as BABYLON from "@babylonjs/core";
 import * as BABYLON_GUI from "@babylonjs/gui";
@@ -57,182 +59,719 @@ export const flock = {
 	flockNotReady: true,
 	lastFrameTime: 0,
 	savedCamera: null,
-	async runCode(code) {
-		let iframe = document.getElementById("flock-iframe");
+	validateUserCodeAST(src) {
+		// 1) Very broad identifier blocklist (names anywhere in user code)
+		const REJECT_IDENTIFIERS = new Set([
+			// dynamic code / reflection
+			"eval",
+			"Function",
+			"AsyncFunction",
+			"GeneratorFunction",
+			"Proxy",
+			"Reflect",
+			// frames & globals
+			"window",
+			"document",
+			"globalThis",
+			"self",
+			"parent",
+			"top",
+			"frames",
+			"frameElement",
+			// navigation & env
+			"location",
+			"history",
+			"navigator",
+			"opener",
+			// network / ipc
+			"fetch",
+			"XMLHttpRequest",
+			"WebSocket",
+			"EventSource",
+			"postMessage",
+			"MessageChannel",
+			"MessagePort",
+			"BroadcastChannel",
+			// workers & worklets
+			"Worker",
+			"SharedWorker",
+			"ServiceWorker",
+			"Worklet",
+			"importScripts",
+			// storage / persistence
+			"localStorage",
+			"sessionStorage",
+			"indexedDB",
+			"caches",
+			"cookieStore",
+			// file/blob/crypto
+			"Blob",
+			"File",
+			"FileReader",
+			"crypto",
+			// urls & media constructors
+			"URL",
+			"URLSearchParams",
+			"Image",
+			"Audio",
+			"RTCPeerConnection",
+			"MediaDevices",
+			"Notification",
+			// popups / UI
+			"open",
+			"alert",
+			"confirm",
+			"prompt",
+			"print",
+			"showModalDialog",
+			// timers (we’ll also do special checks)
+			"setTimeout",
+			"setInterval",
+			"setImmediate",
+			"queueMicrotask",
+			// module-ish
+			"require",
+		]);
 
+		// 2) Callees we never allow (even if shadowed)
+		const REJECT_CALLEES = new Set([
+			"eval",
+			"Function",
+			"AsyncFunction",
+			"GeneratorFunction",
+			"setTimeout",
+			"setInterval",
+			"setImmediate",
+			"queueMicrotask",
+			"open",
+			"alert",
+			"confirm",
+			"prompt",
+			"print",
+		]);
+
+		// 3) Member/property names that are escape hatches
+		const REJECT_PROPERTIES = new Set([
+			"constructor",
+			"__proto__",
+			"prototype",
+			"caller",
+			"callee",
+			"arguments",
+		]);
+		let ast;
 		try {
-			// Step 1: Dispose old scene if iframe exists
-			if (iframe) {
-				await iframe.contentWindow?.flock?.disposeOldScene();
-			} else {
-				// Step 2: Create a new iframe if not found
-				iframe = document.createElement("iframe");
-				iframe.id = "flock-iframe";
-				iframe.style.display = "none";
-				document.body.appendChild(iframe);
-			}
+			ast = acorn.parse(src, {
+				ecmaVersion: "latest",
+				sourceType: "script",
+				allowAwaitOutsideFunction: true,
+				locations: false,
+			});
+		} catch (e) {
+			// Surface syntax errors directly
+			throw e;
+		}
 
-			// Step 3: Wait for iframe to load
-			await new Promise((resolve, reject) => {
-				iframe.onload = () => resolve();
-				iframe.onerror = () =>
-					reject(new Error("Failed to load iframe"));
-				iframe.src = "about:blank";
+		walk.simple(ast, {
+			// Syntax we never allow
+			WithStatement() {
+				throw new Error("with() not allowed");
+			},
+			DebuggerStatement() {
+				throw new Error("debugger not allowed");
+			},
+			ImportDeclaration() {
+				throw new Error("import declarations not allowed");
+			},
+			ExportNamedDeclaration() {
+				throw new Error("export not allowed");
+			},
+			ExportDefaultDeclaration() {
+				throw new Error("export not allowed");
+			},
+			ImportExpression() {
+				throw new Error("dynamic import() not allowed");
+			},
+			MetaProperty(n) {
+				if (n.meta?.name === "import")
+					throw new Error("import.meta not allowed");
+			},
+
+			// Any usage of these identifiers anywhere
+			Identifier(n) {
+				if (REJECT_IDENTIFIERS.has(n.name)) {
+					throw new Error(`Identifier '${n.name}' is not allowed`);
+				}
+			},
+
+			// Ban .constructor / .__proto__ / .prototype / .caller / .callee / .arguments
+			MemberExpression(n) {
+				// foo.bar
+				if (
+					!n.computed &&
+					n.property?.type === "Identifier" &&
+					REJECT_PROPERTIES.has(n.property.name)
+				) {
+					throw new Error(
+						`Access to '.${n.property.name}' is not allowed`,
+					);
+				}
+				// foo["constructor"]
+				if (
+					n.computed &&
+					n.property?.type === "Literal" &&
+					typeof n.property.value === "string" &&
+					REJECT_PROPERTIES.has(n.property.value)
+				) {
+					throw new Error(
+						`Access to '["${n.property.value}"]' is not allowed`,
+					);
+				}
+			},
+
+			// Disallow dangerous callees; forbid string-eval timers
+			CallExpression(n) {
+				const callee = n.callee;
+				const name =
+					callee?.type === "Identifier"
+						? callee.name
+						: callee?.type === "MemberExpression" &&
+							  !callee.computed &&
+							  callee.property?.type === "Identifier"
+							? callee.property.name
+							: null;
+
+				if (name && REJECT_CALLEES.has(name)) {
+					// Special case: timers with string as first arg (string-eval)
+					if (
+						(name === "setTimeout" || name === "setInterval") &&
+						n.arguments[0]?.type === "Literal" &&
+						typeof n.arguments[0].value === "string"
+					) {
+						throw new Error("String-eval timers are not allowed");
+					}
+					// Block all the listed callees regardless
+					throw new Error(`Call to '${name}()' is not allowed`);
+				}
+			},
+
+			// new Function(), new Worker(), etc.
+			NewExpression(n) {
+				const callee = n.callee;
+				const name = callee?.type === "Identifier" ? callee.name : null;
+				if (
+					name &&
+					(REJECT_CALLEES.has(name) || REJECT_IDENTIFIERS.has(name))
+				) {
+					throw new Error(`'new ${name}()' is not allowed`);
+				}
+			},
+		});
+	},
+	createWhitelist({ win, doc, signal, runToken, guard } = {}) {
+		// --- Bind realm-scoped primitives (fallback to parent if win missing) ---
+		const setT =
+			win?.setTimeout?.bind(win) ?? window.setTimeout.bind(window);
+		const clrT =
+			win?.clearTimeout?.bind(win) ?? window.clearTimeout.bind(window);
+		const raf =
+			win?.requestAnimationFrame?.bind(win) ??
+			window.requestAnimationFrame.bind(window);
+		const caf =
+			win?.cancelAnimationFrame?.bind(win) ??
+			window.cancelAnimationFrame.bind(window);
+
+		const nextFrame = () =>
+			new Promise((resolve, reject) => {
+				if (signal?.aborted)
+					return reject(new DOMException("Aborted", "AbortError"));
+				const id = raf(() => resolve());
+				const onAbort = () => {
+					try {
+						caf(id);
+					} catch {}
+					reject(new DOMException("Aborted", "AbortError"));
+				};
+				signal?.addEventListener?.("abort", onAbort, {
+					once: true,
+				});
 			});
 
-			// Step 4: Access iframe window and set up flock
-			const iframeWindow = iframe.contentWindow;
-			if (!iframeWindow) throw new Error("Iframe window is unavailable");
+		// Build the base API (mostly the same as yours)
+		const api = {
+			// Per-run helpers
+			nextFrame,
+			isAborted: () => !!signal?.aborted,
+			// All Flock API methods
+			initialize: this.initialize?.bind(this),
+			createEngine: this.createEngine?.bind(this),
+			playAnimation: this.playAnimation?.bind(this),
+			playSound: this.playSound?.bind(this),
+			stopAllSounds: this.stopAllSounds?.bind(this),
+			playNotes: this.playNotes?.bind(this),
+			setBPM: this.setBPM?.bind(this),
+			createInstrument: this.createInstrument?.bind(this),
+			switchAnimation: this.switchAnimation?.bind(this),
+			highlight: this.highlight?.bind(this),
+			glow: this.glow?.bind(this),
+			createCharacter: this.createCharacter?.bind(this),
+			createObject: this.createObject?.bind(this),
+			createParticleEffect: this.createParticleEffect?.bind(this),
+			create3DText: this.create3DText?.bind(this),
+			createModel: this.createModel?.bind(this),
+			createBox: this.createBox?.bind(this),
+			createSphere: this.createSphere?.bind(this),
+			createCylinder: this.createCylinder?.bind(this),
+			createCapsule: this.createCapsule?.bind(this),
+			createPlane: this.createPlane?.bind(this),
+			cloneMesh: this.cloneMesh?.bind(this),
+			parentChild: this.parentChild?.bind(this),
+			setParent: this.setParent?.bind(this),
+			mergeMeshes: this.mergeMeshes?.bind(this),
+			subtractMeshes: this.subtractMeshes?.bind(this),
+			intersectMeshes: this.intersectMeshes?.bind(this),
+			createHull: this.createHull?.bind(this),
+			hold: this.hold?.bind(this),
+			drop: this.drop?.bind(this),
+			makeFollow: this.makeFollow?.bind(this),
+			stopFollow: this.stopFollow?.bind(this),
+			removeParent: this.removeParent?.bind(this),
+			createGround: this.createGround?.bind(this),
+			createMap: this.createMap?.bind(this),
+			createCustomMap: this.createCustomMap?.bind(this),
+			setSky: this.setSky?.bind(this),
+			lightIntensity: this.lightIntensity?.bind(this),
+			buttonControls: this.buttonControls?.bind(this),
+			getCamera: this.getCamera?.bind(this),
+			cameraControl: this.cameraControl?.bind(this),
+			setCameraBackground: this.setCameraBackground?.bind(this),
+			setXRMode: this.setXRMode?.bind(this),
+			applyForce: this.applyForce?.bind(this),
+			moveByVector: this.moveByVector?.bind(this),
+			glideTo: this.glideTo?.bind(this),
+			createAnimation: this.createAnimation?.bind(this),
+			animateFrom: this.animateFrom?.bind(this),
+			playAnimationGroup: this.playAnimationGroup?.bind(this),
+			pauseAnimationGroup: this.pauseAnimationGroup?.bind(this),
+			stopAnimationGroup: this.stopAnimationGroup?.bind(this),
+			startParticleSystem: this.startParticleSystem?.bind(this),
+			stopParticleSystem: this.stopParticleSystem?.bind(this),
+			resetParticleSystem: this.resetParticleSystem?.bind(this),
+			animateKeyFrames: this.animateKeyFrames?.bind(this),
+			setPivotPoint: this.setPivotPoint?.bind(this),
+			rotate: this.rotate?.bind(this),
+			lookAt: this.lookAt?.bind(this),
+			moveTo: this.moveTo?.bind(this),
+			rotateTo: this.rotateTo?.bind(this),
+			rotateAnim: this.rotateAnim?.bind(this),
+			animateProperty: this.animateProperty?.bind(this),
+			positionAt: this.positionAt?.bind(this),
+			distanceTo: this.distanceTo?.bind(this),
+			wait: this.wait?.bind(this),
+			safeLoop: this.safeLoop?.bind(this),
+			waitUntil: this.waitUntil?.bind(this),
+			show: this.show?.bind(this),
+			hide: this.hide?.bind(this),
+			clearEffects: this.clearEffects?.bind(this),
+			stopAnimations: this.stopAnimations?.bind(this),
+			tint: this.tint?.bind(this),
+			setAlpha: this.setAlpha?.bind(this),
+			dispose: this.dispose?.bind(this),
+			setFog: this.setFog?.bind(this),
+			keyPressed: this.keyPressed?.bind(this),
+			isTouchingSurface: this.isTouchingSurface?.bind(this),
+			seededRandom: this.seededRandom?.bind(this),
+			randomColour: this.randomColour?.bind(this),
+			scaleMesh: this.scaleMesh?.bind(this),
+			resizeMesh: this.resizeMesh?.bind(this),
+			changeColor: this.changeColor?.bind(this),
+			changeColorMesh: this.changeColorMesh?.bind(this),
+			changeMaterial: this.changeMaterial?.bind(this),
+			setMaterial: this.setMaterial?.bind(this),
+			createMaterial: this.createMaterial?.bind(this),
+			textMaterial: this.textMaterial?.bind(this),
+			createDecal: this.createDecal?.bind(this),
+			placeDecal: this.placeDecal?.bind(this),
+			moveForward: this.moveForward?.bind(this),
+			moveSideways: this.moveSideways?.bind(this),
+			strafe: this.strafe?.bind(this),
+			attachCamera: this.attachCamera?.bind(this),
+			canvasControls: this.canvasControls?.bind(this),
+			setPhysics: this.setPhysics?.bind(this),
+			setPhysicsShape: this.setPhysicsShape?.bind(this),
+			checkMeshesTouching: this.checkMeshesTouching?.bind(this),
+			say: this.say?.bind(this),
+			onTrigger: this.onTrigger?.bind(this),
+			onEvent: this.onEvent?.bind(this),
+			broadcastEvent: this.broadcastEvent?.bind(this),
+			start: this.start?.bind(this),
+			forever: this.forever?.bind(this),
+			whenKeyEvent: this.whenKeyEvent?.bind(this),
+			randomInteger: this.randomInteger?.bind(this),
+			printText: this.printText?.bind(this),
+			UIText: this.UIText?.bind(this),
+			UIButton: this.UIButton?.bind(this),
+			onIntersect: this.onIntersect?.bind(this),
+			getProperty: this.getProperty?.bind(this),
+			exportMesh: this.exportMesh?.bind(this),
+			ensureUniqueGeometry: this.ensureUniqueGeometry?.bind(this),
+			createVector3: this.createVector3?.bind(this),
+		};
 
-			iframeWindow.flock = flock;
+		// --- Guard side-effecting APIs so stale runs no-op ---
+		const SIDE_EFFECT_APIS = [
+			"printText",
+			"UIText",
+			"UIButton",
+			"UIInput",
+			"UISlider",
+			"say",
+			"highlight",
+			"glow",
+			"createParticleEffect",
+			"startParticleSystem",
+			"stopParticleSystem",
+			"resetParticleSystem",
+			"playSound",
+			"stopAllSounds",
+			"speak",
+			"broadcastEvent",
+			"onEvent",
+			"onTrigger",
+			"start",
+			"forever",
+			"canvasControls",
+			"buttonControls",
+			"cameraControl",
+			"attachCamera",
+			"setSky",
+			"setFog",
+			"setCameraBackground",
+			"lightIntensity",
+			"create3DText",
+			"createModel",
+			"createBox",
+			"createSphere",
+			"createCylinder",
+			"createCapsule",
+			"createPlane",
+			"mergeMeshes",
+			"subtractMeshes",
+			"intersectMeshes",
+			"createHull",
+			"dispose",
+			"clearEffects",
+			"stopAnimations",
+		];
+		for (const name of SIDE_EFFECT_APIS) {
+			if (typeof api[name] === "function") api[name] = guard(api[name]);
+		}
 
-			await iframeWindow.flock.initializeNewScene();
+		try {
+			return Object.freeze(api);
+		} catch {
+			return api;
+		}
+	},
+	async replaceSandboxIframe({
+		id = "flock-iframe",
+		sameOrigin = true,
+		srcdocHtml,
+	} = {}) {
+		const old = document.getElementById(id);
 
-			// Step 6: Create sandboxed function
-			const sandboxFunction = new iframeWindow.Function(`
-			"use strict";
-
-			const {
-				initialize,
-				createEngine,
-				createScene,
-				playAnimation,
-				playSound,
-				stopAllSounds,
-				playNotes,
-				setBPM,
-				createInstrument,
-				switchAnimation,
-				highlight,
-				glow,
-				createCharacter,
-				createObject,
-				createParticleEffect,
-				create3DText,
-				createModel,
-				createBox,
-				createSphere,
-				createCylinder,
-				createCapsule,
-				createPlane,
-				cloneMesh,
-				parentChild,
-				setParent,
-				mergeMeshes,
-				subtractMeshes,
-				intersectMeshes,
-				createHull,
-				hold, 
-				drop,
-				makeFollow,
-				stopFollow,
-				removeParent,
-				createGround,
-				createMap,
-				createCustomMap,
-				setSky,
-				lightIntensity,
-				buttonControls,
-				getCamera,
-				cameraControl,
-				setCameraBackground,
-				setXRMode,
-				applyForce,
-				moveByVector,
-				glideTo,
-				createAnimation,
-				animateFrom,
-				playAnimationGroup, 
-				pauseAnimationGroup, 
-				stopAnimationGroup,
-				startParticleSystem,
-				stopParticleSystem,
-				resetParticleSystem,
-				animateKeyFrames,
-				setPivotPoint,
-				rotate,
-				lookAt,
-				moveTo,
-				rotateTo,
-				rotateCamera,
-				rotateAnim,
-				animateProperty,
-				positionAt,
-				distanceTo,
-				wait,
-				safeLoop,
-				waitUntil,
-				show,
-				hide,
-				clearEffects,
-				stopAnimations,
-				tint,
-				setAlpha,
-				dispose,
-				setFog,
-				keyPressed,
-				isTouchingSurface,
-				seededRandom,
-				randomColour,
-				scaleMesh,
-				resizeMesh,
-				changeColor,
-				changeColorMesh,
-				changeMaterial,
-				setMaterial,
-				createMaterial,
-				textMaterial,
-				createDecal,
-				placeDecal,
-				moveForward,
-				moveSideways,
-				strafe,
-				attachCamera,
-				canvasControls,
-				setPhysics,
-				setPhysicsShape,
-				checkMeshesTouching,
-				say,
-				onTrigger,
-				onEvent,
-				broadcastEvent,
-				Mesh,
-				start,
-				forever,
-				whenKeyEvent,
-				randomInteger,
-				printText,
-				UIText,
-				UIButton,
-				onIntersect,
-				getProperty,
-				exportMesh,
-				abortSceneExecution,
-				ensureUniqueGeometry,
-			} = flock;
-
-			${code}
-			`);
-
+		// --- 1) Hard teardown of the old iframe (if any) ---
+		if (old) {
 			try {
-				sandboxFunction();
-			} catch (sandboxError) {
-				throw new Error(
-					`Sandbox execution failed: ${sandboxError.message}`,
-				);
+				// Detach handlers first
+				old.onload = null;
+				old.onerror = null;
+
+				// Best-effort stop inside the old realm
+				const w = old.contentWindow;
+				try {
+					w?.cancelAnimationFrame?.(w.__raf);
+				} catch {}
+				try {
+					w?.stop?.();
+				} catch {} // stops loading
+				try {
+					w?.close?.();
+				} catch {} // some browsers free resources
+
+				// Navigate to a harmless page to break references, then remove
+				try {
+					old.src = "about:blank";
+				} catch {}
+			} finally {
+				// Remove from DOM to release the realm
+				old.remove?.();
 			}
-		} catch (error) {
-			// General Error Handling
-			console.error("Error during scene setup or code execution:", error);
+		}
 
-			// Clean up resources and stop execution
+		// --- 2) Create a brand-new iframe (fresh realm) ---
+		const iframe = document.createElement("iframe");
+		iframe.id = id;
+		iframe.style.display = "none";
+
+		// Keep same-origin only if you need to touch iframe DOM/Canvas/WebGL from parent
+		iframe.sandbox = `allow-scripts${sameOrigin ? " allow-same-origin" : ""}`;
+
+		// Prefer srcdoc so CSP is present before any script runs
+		const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'`;
+		const html =
+			srcdocHtml ??
+			`<!doctype html>
+	<meta http-equiv="Content-Security-Policy" content="${csp}">
+	<canvas id="renderCanvas"></canvas>`;
+
+		// Attach to DOM before setting src/srcdoc to ensure load events fire consistently
+		document.body.appendChild(iframe);
+
+		// Load and await readiness
+		await new Promise((resolve, reject) => {
+			iframe.onload = () => {
+				iframe.onload = iframe.onerror = null;
+				resolve();
+			};
+			iframe.onerror = (e) => {
+				iframe.onload = iframe.onerror = null;
+				reject(new Error("iframe failed to load"));
+			};
+			// Use srcdoc when possible; fallback to about:blank + injected head if needed
 			try {
-				flock.audioContext.close();
-				flock.engine.stopRenderLoop();
-				flock.removeEventListeners();
+				iframe.srcdoc = html;
+			} catch {
+				iframe.src = "about:blank";
+			}
+		});
+
+		// If we fell back to about:blank, inject CSP meta now (runs before your code anyway)
+		if (!("srcdoc" in document.createElement("iframe")) || !iframe.srcdoc) {
+			const doc =
+				iframe.contentDocument || iframe.contentWindow?.document;
+			if (!doc.head)
+				doc.documentElement.appendChild(doc.createElement("head"));
+			const meta = doc.createElement("meta");
+			meta.httpEquiv = "Content-Security-Policy";
+			meta.content = csp;
+			doc.head.appendChild(meta);
+			// Optionally inject your canvas or boot HTML here if needed
+		}
+
+		const win = iframe.contentWindow;
+		const doc = iframe.contentDocument || win?.document;
+		if (!win || !doc) throw new Error("New iframe is unavailable");
+
+		return { iframe, win, doc };
+	},
+	async runCode(code) {
+
+		try {
+			flock.validateUserCodeAST(code);
+			await flock.disposeOldScene();
+
+			// at the very start of runCode
+			const oldIframe = document.getElementById("flock-iframe");
+			if (oldIframe) {
+				try {
+					await oldIframe.contentWindow?.flock?.disposeOldScene?.();
+				} catch {}
+				try {
+					oldIframe.onload = oldIframe.onerror = null;
+				} catch {}
+				try {
+					oldIframe.src = "about:blank";
+				} catch {}
+				try {
+					oldIframe.remove();
+				} catch {
+					oldIframe.parentNode?.removeChild(oldIframe);
+				}
+			}
+
+			const { iframe, win, doc } = await flock.replaceSandboxIframe({
+				id: "flock-iframe",
+				sameOrigin: true,
+			});
+
+			// Initialise a fresh scene (unchanged)
+			await this.initializeNewScene?.();
+			if (this.memoryDebug) this.startMemoryMonitoring?.();
+
+			// 5) Build the whitelisted environment
+			// after you have { win, doc } for the new iframe
+			this.__runToken = (this.__runToken || 0) + 1;
+			const runToken = this.__runToken;
+			this.abortController?.abort?.();
+			this.abortController = new AbortController();
+			const signal = this.abortController.signal;
+			const guard =
+				(fn) =>
+				(...args) => {
+					if (signal.aborted || runToken !== this.__runToken) return;
+					return fn(...args);
+				};
+
+			const whitelist = this.createWhitelist({
+				win,
+				doc,
+				signal,
+				runToken,
+				guard,
+			});
+			const wlNames = Object.keys(whitelist);
+			const wlValues = Object.values(whitelist);
+
+			// Shadow dangerous globals by passing them as undefined params
+			const shadowNames = [
+				// Window and frame access
+				"window",
+				"document",
+				"globalThis",
+				"self",
+				"parent",
+				"top",
+				"frames",
+				"frameElement",
+				// Dynamic code execution
+				"Function",
+				"setTimeout",
+				"setInterval",
+				"setImmediate",
+				// Network access
+				"fetch",
+				"XMLHttpRequest",
+				"WebSocket",
+				"EventSource",
+				// Storage APIs
+				"localStorage",
+				"sessionStorage",
+				"indexedDB",
+				"caches",
+				"cookieStore",
+				// Navigation and location
+				"location",
+				"history",
+				"navigator",
+				"opener",
+				// Media/URL surfaces
+				"URL",
+				"URLSearchParams",
+				"Image",
+				"Audio",
+				"RTCPeerConnection",
+				"MediaDevices",
+				"Notification",
+				// Popup and modal APIs
+				"open",
+				"alert",
+				"confirm",
+				"prompt",
+				"print",
+				"showModalDialog",
+				// Messaging APIs
+				"postMessage",
+				"MessageChannel",
+				"MessagePort",
+				"BroadcastChannel",
+				// Worker APIs
+				"Worker",
+				"SharedWorker",
+				"ServiceWorker",
+				"Worklet",
+				"importScripts",
+				// Module/import
+				"eval",
+				"require",
+				"Error",
+				"Blob",
+				"File",
+				"FileReader",
+				"crypto",
+			];
+			const shadowValues = new Array(shadowNames.length).fill(undefined);
+
+			// Pass a frozen, minimal API instead of leaking a global
+			const flockAPI = Object.freeze(whitelist); // or a narrower surface if you like
+
+			const paramNames = shadowNames.concat(["flock"], wlNames);
+			const paramValues = shadowValues.concat([flockAPI], wlValues);
+
+			// Harden constructor escape paths
+			const hardenPrelude =
+				"try{" +
+				'Object.defineProperty(Object.prototype,"constructor",{value:undefined,writable:false,configurable:false});' +
+				'Object.defineProperty(Function.prototype,"constructor",{value:undefined,writable:false,configurable:false});' +
+				"}catch{}";
+
+			const freezePrelude =
+				"try{" +
+				"Object.freeze(Math);Object.freeze(JSON);Object.freeze(Date);Object.freeze(Number);Object.freeze(String);" +
+				"Object.freeze(Boolean);Object.freeze(Array);Object.freeze(Object);Object.freeze(RegExp);" +
+				"Object.freeze(Error);Object.freeze(TypeError);Object.freeze(RangeError);Object.freeze(ReferenceError);Object.freeze(SyntaxError);" +
+				"Object.freeze(Promise);Object.freeze(Set);Object.freeze(Map);Object.freeze(WeakSet);Object.freeze(WeakMap);" +
+				"Object.freeze(ArrayBuffer);Object.freeze(Int8Array);Object.freeze(Uint8Array);Object.freeze(Int16Array);Object.freeze(Uint16Array);" +
+				"Object.freeze(Int32Array);Object.freeze(Uint32Array);Object.freeze(Float32Array);Object.freeze(Float64Array);" +
+				"Object.freeze(Symbol);Object.freeze(Proxy);Object.freeze(Reflect);" +
+				"}catch{}";
+
+			// Assemble the function body safely (adds sourceURL for nicer stacks)
+			const body =
+				hardenPrelude +
+				"\n" +
+				freezePrelude +
+				"\n" +
+				// Use a normal async function so `this` is undefined in strict mode
+				"return (async function(){\n" +
+				'"use strict";\n' +
+				code +
+				"\n}).call(undefined);\n" +
+				"//# sourceURL=user-code.js";
+
+			// Create the sandboxed function inside the iframe realm
+			const run = new win.Function(...paramNames, body);
+
+			// Host timer for timeout guard (shadowed timers inside sandbox)
+			const hostSetTimeout = window.setTimeout.bind(window);
+			const MAX_MS = 5000;
+
+			// Execute with whitelist + timeout
+			await Promise.race([
+				run(...paramValues),
+				new Promise((_, rej) =>
+					hostSetTimeout(
+						() => rej(new Error("User code timed out")),
+						MAX_MS,
+					),
+				),
+			]);
+
+			// Focus canvas (parent or iframe—pick the one you actually use)
+			(
+				document.getElementById("renderCanvas") ||
+				doc.getElementById("renderCanvas")
+			)?.focus();
+		} catch (error) {
+			const enhancedError =
+				this.createEnhancedError?.(error, code) ?? error;
+			console.error("Enhanced error details:", enhancedError);
+
+			this.printText?.({
+				text: `Error: ${error.message}`,
+				duration: 5,
+				color: "#ff0000",
+			});
+
+			try {
+				this.audioContext?.close?.();
+				this.engine?.stopRenderLoop?.();
+				this.removeEventListeners?.();
 			} catch (cleanupError) {
 				console.error("Error during cleanup:", cleanupError);
 			}
+
+			throw error;
 		}
 	},
 	async initialize() {
@@ -3031,8 +3570,8 @@ export const flock = {
 		mesh.blockKey = mesh.name;
 		//mesh.name = `${mesh.name}_${mesh.uniqueId}`;
 
-		flock.applyMaterialToMesh(mesh, shapeType, color, alpha)
-		
+		flock.applyMaterialToMesh(mesh, shapeType, color, alpha);
+
 		mesh.metadata.sharedMaterial = false;
 
 		// Enable and make the mesh visible
@@ -3069,7 +3608,7 @@ export const flock = {
 			mesh.material = material;
 			return;
 		}
-		
+
 		if (shapeType === "Box") {
 			const positions = mesh.getVerticesData(
 				BABYLON.VertexBuffer.PositionKind,
@@ -3221,99 +3760,128 @@ export const flock = {
 			return;
 		}
 		if (shapeType === "Cylinder") {
-		  const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
-		  const indices = mesh.getIndices();
-		  const normals = mesh.getVerticesData(BABYLON.VertexBuffer.NormalKind);
+			const positions = mesh.getVerticesData(
+				BABYLON.VertexBuffer.PositionKind,
+			);
+			const indices = mesh.getIndices();
+			const normals = mesh.getVerticesData(
+				BABYLON.VertexBuffer.NormalKind,
+			);
 
-		  if (!positions || !indices) {
-			console.warn("Missing geometry for cylinder; falling back to uniform color.");
-			return this.applyMaterialToMesh(mesh, shapeType, color[0], alpha);
-		  }
-
-		  const colors = [];
-		  const newPositions = [];
-		  const newNormals = [];
-		  const newIndices = [];
-
-		  const yVals = [];
-		  for (let i = 0; i < positions.length; i += 3) {
-			yVals.push(positions[i + 1]);
-		  }
-
-		  const minY = Math.min(...yVals);
-		  const maxY = Math.max(...yVals);
-
-		  const makeColorFromIndex = (i) => makeColor4(color[i % color.length]);
-
-		  let baseIndex = 0;
-		  let sideFaceIndex = 0;
-
-		  for (let i = 0; i < indices.length; i += 3) {
-			const vi0 = indices[i];
-			const vi1 = indices[i + 1];
-			const vi2 = indices[i + 2];
-
-			const y0 = positions[vi0 * 3 + 1];
-			const y1 = positions[vi1 * 3 + 1];
-			const y2 = positions[vi2 * 3 + 1];
-
-			const isTop = y0 === maxY && y1 === maxY && y2 === maxY;
-			const isBottom = y0 === minY && y1 === minY && y2 === minY;
-
-			let faceColor;
-
-			if (isTop) {
-			  faceColor = makeColor4(color[0]); // always color[0]
-			} else if (isBottom) {
-			  faceColor = makeColor4(color.length > 1 ? color[1] : color[0]); // fallback to top if only 1 color
-			} else {
-			  if (color.length === 2) {
-				faceColor = makeColor4(color[1]);
-			  } else if (color.length === 3) {
-				faceColor = makeColor4(color[2]);
-			  } else {
-				// Use color[2+] for alternating side face colors, one color per 2 triangles
-				const sideColorIndex = 2 + Math.floor(sideFaceIndex / 2);
-				faceColor = makeColor4(color[sideColorIndex % (color.length - 2) + 2]);
-				sideFaceIndex++;
-			  }
-			}
-
-			for (let j = 0; j < 3; j++) {
-			  const vi = indices[i + j];
-
-			  newPositions.push(
-				positions[vi * 3],
-				positions[vi * 3 + 1],
-				positions[vi * 3 + 2]
-			  );
-
-			  if (normals) {
-				newNormals.push(
-				  normals[vi * 3],
-				  normals[vi * 3 + 1],
-				  normals[vi * 3 + 2]
+			if (!positions || !indices) {
+				console.warn(
+					"Missing geometry for cylinder; falling back to uniform color.",
 				);
-			  }
-
-			  colors.push(faceColor.r, faceColor.g, faceColor.b, faceColor.a);
-			  newIndices.push(baseIndex++);
+				return this.applyMaterialToMesh(
+					mesh,
+					shapeType,
+					color[0],
+					alpha,
+				);
 			}
-		  }
 
-		  mesh.setVerticesData(BABYLON.VertexBuffer.PositionKind, newPositions);
-		  if (normals) mesh.setVerticesData(BABYLON.VertexBuffer.NormalKind, newNormals);
-		  mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
-		  mesh.setIndices(newIndices);
+			const colors = [];
+			const newPositions = [];
+			const newNormals = [];
+			const newIndices = [];
 
-		  mesh.hasVertexAlpha = true;
+			const yVals = [];
+			for (let i = 0; i < positions.length; i += 3) {
+				yVals.push(positions[i + 1]);
+			}
 
-		  const mat = new BABYLON.StandardMaterial("cylColorMat", scene);
-		  mat.diffuseColor = BABYLON.Color3.White();
-		  mat.backFaceCulling = false;
-		  mat.vertexColors = true;
-		  mesh.material = mat;
-		  return;
+			const minY = Math.min(...yVals);
+			const maxY = Math.max(...yVals);
+
+			const makeColorFromIndex = (i) =>
+				makeColor4(color[i % color.length]);
+
+			let baseIndex = 0;
+			let sideFaceIndex = 0;
+
+			for (let i = 0; i < indices.length; i += 3) {
+				const vi0 = indices[i];
+				const vi1 = indices[i + 1];
+				const vi2 = indices[i + 2];
+
+				const y0 = positions[vi0 * 3 + 1];
+				const y1 = positions[vi1 * 3 + 1];
+				const y2 = positions[vi2 * 3 + 1];
+
+				const isTop = y0 === maxY && y1 === maxY && y2 === maxY;
+				const isBottom = y0 === minY && y1 === minY && y2 === minY;
+
+				let faceColor;
+
+				if (isTop) {
+					faceColor = makeColor4(color[0]); // always color[0]
+				} else if (isBottom) {
+					faceColor = makeColor4(
+						color.length > 1 ? color[1] : color[0],
+					); // fallback to top if only 1 color
+				} else {
+					if (color.length === 2) {
+						faceColor = makeColor4(color[1]);
+					} else if (color.length === 3) {
+						faceColor = makeColor4(color[2]);
+					} else {
+						// Use color[2+] for alternating side face colors, one color per 2 triangles
+						const sideColorIndex =
+							2 + Math.floor(sideFaceIndex / 2);
+						faceColor = makeColor4(
+							color[(sideColorIndex % (color.length - 2)) + 2],
+						);
+						sideFaceIndex++;
+					}
+				}
+
+				for (let j = 0; j < 3; j++) {
+					const vi = indices[i + j];
+
+					newPositions.push(
+						positions[vi * 3],
+						positions[vi * 3 + 1],
+						positions[vi * 3 + 2],
+					);
+
+					if (normals) {
+						newNormals.push(
+							normals[vi * 3],
+							normals[vi * 3 + 1],
+							normals[vi * 3 + 2],
+						);
+					}
+
+					colors.push(
+						faceColor.r,
+						faceColor.g,
+						faceColor.b,
+						faceColor.a,
+					);
+					newIndices.push(baseIndex++);
+				}
+			}
+
+			mesh.setVerticesData(
+				BABYLON.VertexBuffer.PositionKind,
+				newPositions,
+			);
+			if (normals)
+				mesh.setVerticesData(
+					BABYLON.VertexBuffer.NormalKind,
+					newNormals,
+				);
+			mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
+			mesh.setIndices(newIndices);
+
+			mesh.hasVertexAlpha = true;
+
+			const mat = new BABYLON.StandardMaterial("cylColorMat", scene);
+			mat.diffuseColor = BABYLON.Color3.White();
+			mat.backFaceCulling = false;
+			mat.vertexColors = true;
+			mesh.material = mat;
+			return;
 		}
 
 		const material = new BABYLON.StandardMaterial(
@@ -3446,7 +4014,7 @@ export const flock = {
 
 		// Initialise the mesh with position, color, and other properties
 		flock.initializeMesh(newBox, position, color, "Box", alpha);
-		
+
 		newBox.position.y += height / 2; // Middle of the box
 		newBox.blockKey = blockKey;
 
@@ -5176,9 +5744,7 @@ export const flock = {
 		flock.controlsTexture.rootContainer.isEnabled = enabled;
 
 		// Only create/update controls if they don't exist yet
-		if (
-			enabled 
-		) {
+		if (enabled) {
 			if (control == "ARROWS" || control == "BOTH")
 				flock.createArrowControls(color);
 			if (control == "ACTIONS" || control == "BOTH")
@@ -6286,6 +6852,9 @@ export const flock = {
 
 		//if(hit.hit) {console.log(hit.pickedMesh.name, hit.distance);}
 		return hit.hit && hit.pickedMesh !== null && hit.distance <= 0.06;
+	},
+	createVector3(x, y, z) {
+		return new flock.BABYLON.Vector3(x, y, z);
 	},
 	keyPressed(key) {
 		// Combine all input sources: keys, buttons, and controllers
