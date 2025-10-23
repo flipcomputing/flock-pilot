@@ -494,7 +494,7 @@ async function exportCode() {
 
 		const json = Blockly.serialization.workspaces.save(workspace);
 
-		const jsonString = JSON.stringify(validatedJson, null, 2); // Pretty-print the JSON
+		const jsonString = JSON.stringify(json, null, 2); // Pretty-print the JSON
 
 		// Use File System Access API if available
 		if ("showSaveFilePicker" in window) {
